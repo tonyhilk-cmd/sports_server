@@ -8,7 +8,12 @@ load_dotenv()
 BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
-app = FastAPI()
+app = FastAPI(
+    servers=[
+        {"url": "https://sports-server-a18t.onrender.com"}
+    ]
+)
+
 
 def verify_key(x_api_key: str | None):
     if x_api_key != INTERNAL_API_KEY:
