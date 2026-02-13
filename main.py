@@ -1,9 +1,21 @@
 import os
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.openapi.utils import get_openapi
+from cachetools import TTLCache
+from datetime import date
 import httpx
 from dotenv import load_dotenv
 from datetime import datetime
+
+SAFE_MODE = False
+
+import json
+import logging
+
+USAGE_FILE = "odds_usage.json"
+WARNING_THRESHOLD = 450
+
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
@@ -13,6 +25,13 @@ INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
 
 BASE_NBA = "https://api.balldontlie.io/v1"
 BASE_ODDS = "https://api.the-odds-api.com/v4"
+
+# Cache odds for 30 seconds
+odds_cache = TTLCache(maxsize=10, ttl=60)
+
+ODDS_MONTHLY_LIMIT = 480
+odds_call_count = 0
+odds_call_month = date.today().month
 
 app = FastAPI(title="Sports API", version="1.0.0", description="Sports data backend")
 
@@ -52,6 +71,26 @@ async def search_player(name: str, x_api_key: str | None = Header(default=None))
         r = await client.get(f"{BASE_NBA}/players", headers=headers, params=params)
 
     return r.json()
+
+@app.get("/nba/player/{player_id}/last5")
+async def last5(player_id: int, season: int, x_api_key: str | None = Header(default=None)):
+    verify_key(x_api_key)
+
+    headers = {"Authorization": BALLDONTLIE_API_KEY}
+    params = {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": 50
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{BASE_NBA}/game_player_stats", headers=headers, params=params)
+
+    data = r.json().get("data", [])
+    data = sorted(data, key=lambda x: x["game"]["date"])
+    last_5 = data[-5:]
+
+    return last_5
 
 @app.get("/nba/player/{player_id}/last10")
 async def last10(player_id: int, season: int, x_api_key: str | None = Header(default=None)):
@@ -98,18 +137,115 @@ async def injuries(x_api_key: str | None = Header(default=None)):
 
     return r.json()
 
+def load_usage():
+    if not os.path.exists(USAGE_FILE):
+        return {"month": date.today().month, "count": 0}
+    with open(USAGE_FILE, "r") as f:
+        return json.load(f)
+
+def save_usage(data):
+    with open(USAGE_FILE, "w") as f:
+        json.dump(data, f)
+
+@app.get("/nba/player/{player_id}/vs")
+async def player_vs_team(player_id: int, team_abbr: str, season: int, x_api_key: str | None = Header(default=None)):
+    verify_key(x_api_key)
+
+    headers = {"Authorization": BALLDONTLIE_API_KEY}
+    params = {
+        "player_ids[]": player_id,
+        "seasons[]": season,
+        "per_page": 100
+    }
+
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{BASE_NBA}/game_player_stats", headers=headers, params=params)
+
+    data = r.json().get("data", [])
+    filtered = [g for g in data if g["game"]["home_team"]["abbreviation"] == team_abbr
+                or g["game"]["visitor_team"]["abbreviation"] == team_abbr]
+
+    return filtered
+
 @app.get("/odds/nba")
 async def nba_odds(x_api_key: str | None = Header(default=None)):
+
     verify_key(x_api_key)
+
+    today = date.today()
+    usage = load_usage()
+
+    # Reset if month changed
+    if usage["month"] != today.month:
+        usage = {"month": today.month, "count": 0}
+        save_usage(usage)
+    if SAFE_MODE:
+         return {"message": "Safe mode enabled — odds API disabled"}
+
+    # Cache check
+    if "nba_odds" in odds_cache:
+        return odds_cache["nba_odds"]
+
+    # Hard limit
+    if usage["count"] >= ODDS_MONTHLY_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Monthly odds API limit reached ({ODDS_MONTHLY_LIMIT})"
+        )
 
     params = {
         "apiKey": ODDS_API_KEY,
         "regions": "us",
-        "markets": "h2h,spreads,totals",
-        "sport": "basketball_nba"
+        "markets": "h2h,spreads,totals"
     }
 
     async with httpx.AsyncClient() as client:
-        r = await client.get(f"{BASE_ODDS}/sports/basketball_nba/odds", params=params)
+        r = await client.get(
+            f"{BASE_ODDS}/sports/basketball_nba/odds",
+            params=params
+        )
 
-    return r.json()
+    data = r.json()
+
+    # Increment and persist
+    usage["count"] += 1
+    save_usage(usage)
+
+logging.info(f"Odds API call #{usage['count']} this month")
+
+    response = {
+        "calls_used_this_month": usage["count"],
+        "limit": ODDS_MONTHLY_LIMIT,
+        "remaining": ODDS_MONTHLY_LIMIT - usage["count"],
+        "data": data
+    }
+
+    if usage["count"] >= WARNING_THRESHOLD:
+        response["warning"] = "Approaching monthly odds API limit"
+
+    odds_cache["nba_odds"] = response
+
+    return response
+
+@app.get("/odds/usage")
+def odds_usage(x_api_key: str | None = Header(default=None)):
+    verify_key(x_api_key)
+
+    usage = load_usage()
+
+    return {
+        "month": usage["month"],
+        "calls_used": usage["count"],
+        "limit": ODDS_MONTHLY_LIMIT,
+        "remaining": ODDS_MONTHLY_LIMIT - usage["count"]
+    }
+
+@app.get("/system/status")
+async def system_status(x_api_key: str | None = Header(default=None)):
+    verify_key(x_api_key)
+
+    return {
+        "balldontlie_configured": BALLDONTLIE_API_KEY is not None,
+        "odds_api_configured": ODDS_API_KEY is not None,
+        "internal_auth_enabled": INTERNAL_API_KEY is not None
+    }
