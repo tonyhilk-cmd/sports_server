@@ -211,7 +211,7 @@ async def nba_odds(x_api_key: str | None = Header(default=None)):
     usage["count"] += 1
     save_usage(usage)
 
-logging.info(f"Odds API call #{usage['count']} this month")
+    logging.info(f"Odds API call #{usage['count']} this month")
 
     response = {
         "calls_used_this_month": usage["count"],
