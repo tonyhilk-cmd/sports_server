@@ -1,4 +1,6 @@
+import hashlib
 import json
+import logging
 import os
 from datetime import date
 from pathlib import Path
@@ -6,7 +8,7 @@ from pathlib import Path
 import httpx
 from cachetools import TTLCache
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.security import APIKeyHeader
 
 
@@ -28,23 +30,43 @@ HTTP_TIMEOUT = httpx.Timeout(20.0)
 
 odds_cache = TTLCache(maxsize=10, ttl=60)
 api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+logger = logging.getLogger("sports_api")
 
 app = FastAPI(
     title="Sports API",
-    version="2.2.0",
+    version="2.2.1",
     servers=[{"url": PUBLIC_BASE_URL, "description": "Public deployment"}],
 )
 
 
+def key_fingerprint(value: str | None) -> str:
+    if not value:
+        return "missing"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
 def require_setting(name: str, value: str | None) -> str:
     if not value:
+        logger.error("%s is not configured", name)
         raise HTTPException(status_code=500, detail=f"{name} not configured")
     return value
 
 
-def verify_key(x_api_key: str | None = Security(api_key_header)) -> None:
+def verify_key(
+    request: Request,
+    x_api_key: str | None = Security(api_key_header),
+) -> None:
     expected_key = require_setting("INTERNAL_API_KEY", INTERNAL_API_KEY)
     if x_api_key != expected_key:
+        logger.warning(
+            "auth_failed path=%s method=%s header_present=%s provided_fp=%s expected_fp=%s user_agent=%r",
+            request.url.path,
+            request.method,
+            x_api_key is not None,
+            key_fingerprint(x_api_key),
+            key_fingerprint(expected_key),
+            request.headers.get("user-agent"),
+        )
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
