@@ -134,6 +134,18 @@ def root():
     return {"message": "Sports server running"}
 
 
+@app.get("/debug/auth-header")
+def debug_auth_header(request: Request):
+    provided_key = request.headers.get("x-api-key")
+    expected_key = require_setting("INTERNAL_API_KEY", INTERNAL_API_KEY)
+    return {
+        "header_present": provided_key is not None,
+        "matches_expected": provided_key == expected_key,
+        "provided_fp": key_fingerprint(provided_key),
+        "user_agent": request.headers.get("user-agent"),
+    }
+
+
 @app.get("/nba/player/search", dependencies=[Depends(verify_key)])
 async def search_player(name: str):
     params = {"search": name, "per_page": "10"}
