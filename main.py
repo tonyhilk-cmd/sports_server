@@ -58,6 +58,16 @@ def verify_key(
 ) -> None:
     expected_key = require_setting("INTERNAL_API_KEY", INTERNAL_API_KEY)
     if x_api_key != expected_key:
+        debug_line = (
+            "auth_failed "
+            f"path={request.url.path} "
+            f"method={request.method} "
+            f"header_present={x_api_key is not None} "
+            f"provided_fp={key_fingerprint(x_api_key)} "
+            f"expected_fp={key_fingerprint(expected_key)} "
+            f"user_agent={request.headers.get('user-agent')!r}"
+        )
+        print(debug_line, flush=True)
         logger.warning(
             "auth_failed path=%s method=%s header_present=%s provided_fp=%s expected_fp=%s user_agent=%r",
             request.url.path,
