@@ -1,101 +1,151 @@
-import os
-from fastapi import FastAPI, HTTPException, Header
-from cachetools import TTLCache
-from datetime import date
-import httpx
-from dotenv import load_dotenv
 import json
+import os
+from datetime import date
+from pathlib import Path
 
-load_dotenv()
+import httpx
+from cachetools import TTLCache
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
 BALLDONTLIE_API_KEY = os.getenv("BALLDONTLIE_API_KEY")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://sports-server-a18t.onrender.com")
 
 BASE_NBA = "https://api.balldontlie.io/v1"
 BASE_ODDS = "https://api.the-odds-api.com/v4"
 
 SAFE_MODE = False
-USAGE_FILE = "odds_usage.json"
+USAGE_FILE = BASE_DIR / "odds_usage.json"
 ODDS_MONTHLY_LIMIT = 480
+HTTP_TIMEOUT = httpx.Timeout(20.0)
 
 odds_cache = TTLCache(maxsize=10, ttl=60)
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
-app = FastAPI(title="Sports API", version="2.1.0")
+app = FastAPI(
+    title="Sports API",
+    version="2.2.0",
+    servers=[{"url": PUBLIC_BASE_URL, "description": "Public deployment"}],
+)
 
-# ---------------- AUTH ---------------- #
 
-def verify_key(x_api_key: str | None):
-    if x_api_key != INTERNAL_API_KEY:
+def require_setting(name: str, value: str | None) -> str:
+    if not value:
+        raise HTTPException(status_code=500, detail=f"{name} not configured")
+    return value
+
+
+def verify_key(x_api_key: str | None = Security(api_key_header)) -> None:
+    expected_key = require_setting("INTERNAL_API_KEY", INTERNAL_API_KEY)
+    if x_api_key != expected_key:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-# ---------------- ROOT ---------------- #
+
+async def fetch_json(
+    url: str,
+    *,
+    service_name: str,
+    headers: dict[str, str] | None = None,
+    params: dict[str, str] | None = None,
+):
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=exc.response.status_code,
+            detail=f"{service_name} request failed",
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{service_name} request could not be completed",
+        ) from exc
+
+    return response.json()
+
+
+def nba_headers() -> dict[str, str]:
+    return {"Authorization": require_setting("BALLDONTLIE_API_KEY", BALLDONTLIE_API_KEY)}
+
+
+def odds_params() -> dict[str, str]:
+    return {
+        "apiKey": require_setting("ODDS_API_KEY", ODDS_API_KEY),
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+    }
+
+
+def load_usage():
+    if not USAGE_FILE.exists():
+        return {"month": date.today().month, "count": 0}
+    with USAGE_FILE.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_usage(data):
+    with USAGE_FILE.open("w", encoding="utf-8") as f:
+        json.dump(data, f)
+
 
 @app.get("/")
 def root():
     return {"message": "Sports server running"}
 
-# ---------------- PLAYER SEARCH ---------------- #
 
-@app.get("/nba/player/search")
-async def search_player(name: str, x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
-
-    headers = {"Authorization": BALLDONTLIE_API_KEY}
+@app.get("/nba/player/search", dependencies=[Depends(verify_key)])
+async def search_player(name: str):
     params = {"search": name, "per_page": "10"}
+    return await fetch_json(
+        f"{BASE_NBA}/players",
+        service_name="BallDontLie",
+        headers=nba_headers(),
+        params=params,
+    )
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{BASE_NBA}/players", headers=headers, params=params)
-
-    return r.json()
-
-# ---------------- PLAYER GAME LOGS ---------------- #
 
 async def fetch_player_stats(player_id: int, season: int):
-    headers = {"Authorization": BALLDONTLIE_API_KEY}
-
     params = {
         "player_ids[]": str(player_id),
         "seasons[]": str(season),
-        "per_page": "100"
+        "per_page": "100",
     }
+    response = await fetch_json(
+        f"{BASE_NBA}/stats",
+        service_name="BallDontLie",
+        headers=nba_headers(),
+        params=params,
+    )
+    return response.get("data", [])
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{BASE_NBA}/stats",
-            headers=headers,
-            params=params
-        )
 
-    print("=== DEBUG REQUEST URL ===")
-    print(r.request.url)
-    print("=== DEBUG RESPONSE ===")
-    print(r.json())
-
-    return r.json().get("data", [])
-
-@app.get("/nba/player/{player_id}/last5")
-async def last5(player_id: int, season: int, x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
-
+@app.get("/nba/player/{player_id}/last5", dependencies=[Depends(verify_key)])
+async def last5(player_id: int, season: int):
     data = await fetch_player_stats(player_id, season)
     data = sorted(data, key=lambda x: x["game"]["date"])
     return data[-5:]
 
-@app.get("/nba/player/{player_id}/last10")
-async def last10(player_id: int, season: int, x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
 
+@app.get("/nba/player/{player_id}/last10", dependencies=[Depends(verify_key)])
+async def last10(player_id: int, season: int):
     data = await fetch_player_stats(player_id, season)
     data = sorted(data, key=lambda x: x["game"]["date"])
     last_10 = data[-10:]
 
     totals = {"pts": 0, "reb": 0, "ast": 0}
-
-    for g in last_10:
-        totals["pts"] += g.get("pts", 0)
-        totals["reb"] += g.get("reb", 0)
-        totals["ast"] += g.get("ast", 0)
+    for game in last_10:
+        totals["pts"] += game.get("pts", 0)
+        totals["reb"] += game.get("reb", 0)
+        totals["ast"] += game.get("ast", 0)
 
     n = max(len(last_10), 1)
     averages = {k: round(v / n, 2) for k, v in totals.items()}
@@ -104,46 +154,38 @@ async def last10(player_id: int, season: int, x_api_key: str | None = Header(def
         "player_id": player_id,
         "season": season,
         "games": last_10,
-        "averages": averages
+        "averages": averages,
     }
 
-# ---------------- INJURIES ---------------- #
 
-@app.get("/nba/injuries")
-async def injuries(x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
+@app.get("/nba/injuries", dependencies=[Depends(verify_key)])
+async def injuries():
+    return await fetch_json(
+        f"{BASE_NBA}/player_injuries",
+        service_name="BallDontLie",
+        headers=nba_headers(),
+    )
 
-    headers = {"Authorization": BALLDONTLIE_API_KEY}
 
-    async with httpx.AsyncClient() as client:
-        r = await client.get(f"{BASE_NBA}/player_injuries", headers=headers)
-
-    return r.json()
-
-# ---------------- GAME DAY ---------------- #
-
-@app.get("/nba/gameday")
-async def gameday(include_odds: bool = False, x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
-
+@app.get("/nba/gameday", dependencies=[Depends(verify_key)])
+async def gameday(include_odds: bool = False):
     today = date.today().isoformat()
-    headers = {"Authorization": BALLDONTLIE_API_KEY}
-
-    async with httpx.AsyncClient() as client:
-        games = await client.get(
-            f"{BASE_NBA}/games",
-            headers=headers,
-            params={"dates[]": today}
-        )
-
-        injuries = await client.get(
-            f"{BASE_NBA}/player_injuries",
-            headers=headers
-        )
-
     response = {
-        "games": games.json().get("data", []),
-        "injuries": injuries.json().get("data", [])
+        "games": (
+            await fetch_json(
+                f"{BASE_NBA}/games",
+                service_name="BallDontLie",
+                headers=nba_headers(),
+                params={"dates[]": today},
+            )
+        ).get("data", []),
+        "injuries": (
+            await fetch_json(
+                f"{BASE_NBA}/player_injuries",
+                service_name="BallDontLie",
+                headers=nba_headers(),
+            )
+        ).get("data", []),
     }
 
     if include_odds:
@@ -151,17 +193,6 @@ async def gameday(include_odds: bool = False, x_api_key: str | None = Header(def
 
     return response
 
-# ---------------- ODDS SYSTEM ---------------- #
-
-def load_usage():
-    if not os.path.exists(USAGE_FILE):
-        return {"month": date.today().month, "count": 0}
-    with open(USAGE_FILE, "r") as f:
-        return json.load(f)
-
-def save_usage(data):
-    with open(USAGE_FILE, "w") as f:
-        json.dump(data, f)
 
 async def nba_odds_internal():
     if SAFE_MODE:
@@ -180,17 +211,11 @@ async def nba_odds_internal():
     if "nba_odds" in odds_cache:
         return odds_cache["nba_odds"]
 
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "markets": "h2h,spreads,totals"
-    }
-
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{BASE_ODDS}/sports/basketball_nba/odds",
-            params=params
-        )
+    response_data = await fetch_json(
+        f"{BASE_ODDS}/sports/basketball_nba/odds",
+        service_name="The Odds API",
+        params=odds_params(),
+    )
 
     usage["count"] += 1
     save_usage(usage)
@@ -199,26 +224,24 @@ async def nba_odds_internal():
         "calls_used_this_month": usage["count"],
         "limit": ODDS_MONTHLY_LIMIT,
         "remaining": ODDS_MONTHLY_LIMIT - usage["count"],
-        "data": r.json()
+        "data": response_data,
     }
 
     odds_cache["nba_odds"] = response
     return response
 
-@app.get("/odds/nba")
-async def nba_odds(x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
+
+@app.get("/odds/nba", dependencies=[Depends(verify_key)])
+async def nba_odds():
     return await nba_odds_internal()
 
-@app.get("/odds/usage")
-def odds_usage(x_api_key: str | None = Header(default=None)):
-    verify_key(x_api_key)
 
+@app.get("/odds/usage", dependencies=[Depends(verify_key)])
+def odds_usage():
     usage = load_usage()
-
     return {
         "month": usage["month"],
         "calls_used": usage["count"],
         "limit": ODDS_MONTHLY_LIMIT,
-        "remaining": ODDS_MONTHLY_LIMIT - usage["count"]
+        "remaining": ODDS_MONTHLY_LIMIT - usage["count"],
     }
