@@ -34,8 +34,14 @@ api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
 
 app = FastAPI(
     title="Sports API",
-    version="2.3.0",
+    version="2.3.1",
     servers=[{"url": PUBLIC_BASE_URL, "description": "Public deployment"}],
+)
+
+SEASON_PARAM_DESCRIPTION = (
+    "BallDontLie season uses the starting year of the NBA season. "
+    "Example: 2025 means the 2025-26 season. "
+    "If omitted, this API defaults to the current BallDontLie season."
 )
 
 
@@ -139,6 +145,16 @@ def load_usage():
 def save_usage(data):
     with USAGE_FILE.open("w", encoding="utf-8") as f:
         json.dump(data, f)
+
+
+def current_nba_season(today: date | None = None) -> int:
+    if today is None:
+        today = date.today()
+    return today.year if today.month >= 10 else today.year - 1
+
+
+def resolve_season(season: int | None) -> int:
+    return season if season is not None else current_nba_season()
 
 
 def sort_game_logs(games: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -454,7 +470,10 @@ async def nba_odds_internal():
 
 @app.get("/")
 def root():
-    return {"message": "Sports server running"}
+    return {
+        "message": "Sports server running",
+        "current_nba_season": current_nba_season(),
+    }
 
 
 @app.get("/nba/player/search", dependencies=[Depends(verify_key)])
@@ -469,19 +488,27 @@ async def search_player(name: str):
 
 
 @app.get("/nba/player/{player_id}/last5", dependencies=[Depends(verify_key)])
-async def last5(player_id: int, season: int):
-    data = await fetch_player_stats(player_ids=[player_id], season=season)
+async def last5(
+    player_id: int,
+    season: int | None = Query(default=None, description=SEASON_PARAM_DESCRIPTION),
+):
+    resolved_season = resolve_season(season)
+    data = await fetch_player_stats(player_ids=[player_id], season=resolved_season)
     return data[-5:]
 
 
 @app.get("/nba/player/{player_id}/last10", dependencies=[Depends(verify_key)])
-async def last10(player_id: int, season: int):
-    data = await fetch_player_stats(player_ids=[player_id], season=season)
+async def last10(
+    player_id: int,
+    season: int | None = Query(default=None, description=SEASON_PARAM_DESCRIPTION),
+):
+    resolved_season = resolve_season(season)
+    data = await fetch_player_stats(player_ids=[player_id], season=resolved_season)
     last_10 = data[-10:]
 
     return {
         "player_id": player_id,
-        "season": season,
+        "season": resolved_season,
         "games": last_10,
         "averages": summarize_games(last_10)["averages"],
     }
@@ -490,14 +517,15 @@ async def last10(player_id: int, season: int):
 @app.get("/nba/player/{player_id}/analysis", dependencies=[Depends(verify_key)])
 async def player_analysis(
     player_id: int,
-    season: int,
+    season: int | None = Query(default=None, description=SEASON_PARAM_DESCRIPTION),
     recent_games: int = Query(default=10, ge=3, le=20),
     stat: str | None = None,
     line: float | None = None,
     include_injury_context: bool = True,
     max_injured_teammates: int = Query(default=3, ge=1, le=6),
 ):
-    player_games = await fetch_player_stats(player_ids=[player_id], season=season)
+    resolved_season = resolve_season(season)
+    player_games = await fetch_player_stats(player_ids=[player_id], season=resolved_season)
     if not player_games:
         raise HTTPException(status_code=404, detail="No game stats found for that player and season")
 
@@ -512,7 +540,8 @@ async def player_analysis(
     response: dict[str, Any] = {
         "player": player_info,
         "team": team_info,
-        "season": season,
+        "season": resolved_season,
+        "current_nba_season": current_nba_season(),
         "games_played": len(player_games),
         "season_summary": summarize_games(player_games),
         "last_5_summary": summarize_games(player_games[-5:]),
@@ -534,7 +563,7 @@ async def player_analysis(
     if include_injury_context:
         response["injury_context"] = await build_injury_context(
             player_id=player_id,
-            season=season,
+            season=resolved_season,
             player_games=player_games,
             stat=normalized_stat,
             line=line,
